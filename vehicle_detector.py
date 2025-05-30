@@ -1,6 +1,7 @@
 """
 Vehicle Detection System using YOLOv8n
 This module provides functionality to detect vehicles in images, videos, and live camera feeds.
+It also detects license plates within detected vehicles.
 """
 
 import cv2
@@ -24,19 +25,33 @@ class VehicleDetector:
     - Static images
     - Video files
     - Live camera feeds
+
+    It can also detect license plates within the detected vehicles.
     """
 
-    def __init__(self, model_path: str = "yolov8n.pt", confidence_threshold: float = 0.5):
+    def __init__(self,
+                model_path: str = "yolov8n.pt",
+                confidence_threshold: float = 0.5,
+                license_plate_model_path: str = "licenseplatedetectyolo.pt",
+                license_plate_confidence: float = 0.5,
+                max_vehicles: int = 2):
         """
         Initialize the vehicle detector.
 
         Args:
             model_path (str): Path to the YOLO model file. Defaults to "yolov8n.pt"
             confidence_threshold (float): Minimum confidence score for detections
+            license_plate_model_path (str): Path to license plate detection model
+            license_plate_confidence (float): Confidence threshold for license plate detection
+            max_vehicles (int): Maximum number of vehicles to detect per frame
         """
         self.model_path = model_path
+        self.license_plate_model_path = license_plate_model_path
         self.confidence_threshold = confidence_threshold
+        self.license_plate_confidence = license_plate_confidence
+        self.max_vehicles = max_vehicles
         self.model = None
+        self.license_plate_model = None
 
         # Vehicle class IDs in COCO dataset (used by YOLOv8)
         self.vehicle_classes = {
@@ -49,17 +64,21 @@ class VehicleDetector:
         self._load_model()
 
     def _load_model(self):
-        """Load the YOLOv8 model."""
+        """Load the YOLOv8 models."""
         try:
-            logger.info(f"Loading YOLO model: {self.model_path}")
+            logger.info(f"Loading vehicle detection model: {self.model_path}")
             self.model = YOLO(self.model_path)
-            logger.info("Model loaded successfully")
+            logger.info("Vehicle model loaded successfully")
+
+            logger.info(f"Loading license plate detection model: {self.license_plate_model_path}")
+            self.license_plate_model = YOLO(self.license_plate_model_path)
+            logger.info("License plate model loaded successfully")
         except Exception as e:
             logger.error(f"Error loading model: {e}")
             raise
 
     def detect_vehicles_image(self, image_path: str, save_result: bool = True,
-                             output_path: Optional[str] = None) -> List[dict]:
+                             output_path: str = './output/') -> List[dict]:
         """
         Detect vehicles in a single image.
 
@@ -83,9 +102,21 @@ class VehicleDetector:
             # Process results
             detections = self._process_results(results[0], image.shape)
 
+            # Limit to max_vehicles
+            detections = detections[:self.max_vehicles] if len(detections) > self.max_vehicles else detections
+
+            # Detect license plates in each vehicle
+            for detection in detections:
+                vehicle_crop = self._crop_vehicle(image, detection['bbox'])
+                license_plates = self._detect_license_plate(vehicle_crop)
+                detection['license_plates'] = license_plates
+
             if save_result:
                 annotated_image = self._draw_detections(image.copy(), detections)
-                output_file = output_path or f"detected_{Path(image_path).name}"
+                if output_path:
+                    output_file = f'{output_path}'+f'detected_{Path(image_path).name}'
+                else:
+                    output_file = f"detected_{Path(image_path).name}"
                 cv2.imwrite(output_file, annotated_image)
                 logger.info(f"Annotated image saved to: {output_file}")
 
@@ -97,7 +128,7 @@ class VehicleDetector:
             raise
 
     def detect_vehicles_video(self, video_path: str, save_result: bool = True,
-                             output_path: Optional[str] = None, display_live: bool = False) -> None:
+                             output_path: str = './output/', display_live: bool = False) -> None:
         """
         Detect vehicles in a video file.
 
@@ -124,8 +155,11 @@ class VehicleDetector:
             # Set up video writer if saving
             out = None
             if save_result:
-                output_file = output_path or f"detected_{Path(video_path).name}"
-                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                if output_path:
+                    output_file = f'{output_path}'+f'detected_{Path(video_path).name}'
+                else:
+                    output_file = f"detected_{Path(video_path).name}"
+                fourcc = cv2.VideoWriter_fourcc(*'H264')
                 out = cv2.VideoWriter(output_file, fourcc, fps, (width, height))
 
             frame_count = 0
@@ -139,6 +173,15 @@ class VehicleDetector:
                 # Run inference
                 results = self.model(frame, conf=self.confidence_threshold)
                 detections = self._process_results(results[0], frame.shape)
+
+                # Limit to max_vehicles
+                detections = detections[:self.max_vehicles] if len(detections) > self.max_vehicles else detections
+
+                # Detect license plates in each vehicle
+                for detection in detections:
+                    vehicle_crop = self._crop_vehicle(frame, detection['bbox'])
+                    license_plates = self._detect_license_plate(vehicle_crop)
+                    detection['license_plates'] = license_plates
 
                 # Draw detections
                 annotated_frame = self._draw_detections(frame.copy(), detections)
@@ -211,6 +254,16 @@ class VehicleDetector:
                 start_inference = time.time()
                 results = self.model(frame, conf=self.confidence_threshold)
                 detections = self._process_results(results[0], frame.shape)
+
+                # Limit to max_vehicles
+                detections = detections[:self.max_vehicles] if len(detections) > self.max_vehicles else detections
+
+                # Detect license plates in each vehicle
+                for detection in detections:
+                    vehicle_crop = self._crop_vehicle(frame, detection['bbox'])
+                    license_plates = self._detect_license_plate(vehicle_crop)
+                    detection['license_plates'] = license_plates
+
                 inference_time = time.time() - start_inference
 
                 # Draw detections
@@ -253,6 +306,71 @@ class VehicleDetector:
             logger.error(f"Error in live detection: {e}")
             raise
 
+    def _crop_vehicle(self, image: np.ndarray, bbox: dict) -> np.ndarray:
+        """
+        Crop a vehicle from the image based on bounding box.
+
+        Args:
+            image: Input image
+            bbox: Bounding box dictionary with x1, y1, x2, y2
+
+        Returns:
+            np.ndarray: Cropped vehicle image
+        """
+        x1, y1, x2, y2 = bbox['x1'], bbox['y1'], bbox['x2'], bbox['y2']
+
+        # Ensure crop coordinates are within image boundaries
+        height, width = image.shape[:2]
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        x2 = min(width, x2)
+        y2 = min(height, y2)
+
+        return image[y1:y2, x1:x2]
+
+    def _detect_license_plate(self, vehicle_image: np.ndarray) -> List[dict]:
+        """
+        Detect license plates in a vehicle image.
+
+        Args:
+            vehicle_image: Cropped vehicle image
+
+        Returns:
+            List[dict]: List of detected license plates
+        """
+        if vehicle_image.size == 0 or vehicle_image.shape[0] == 0 or vehicle_image.shape[1] == 0:
+            return []
+
+        # Run inference on license plate model
+        try:
+            results = self.license_plate_model(vehicle_image, conf=self.license_plate_confidence)
+
+            license_plates = []
+
+            if results[0].boxes is not None:
+                boxes = results[0].boxes.xyxy.cpu().numpy()
+                confidences = results[0].boxes.conf.cpu().numpy()
+
+                for i, (box, conf) in enumerate(zip(boxes, confidences)):
+                    x1, y1, x2, y2 = box
+                    license_plate = {
+                        'confidence': float(conf),
+                        'bbox': {
+                            'x1': int(x1),
+                            'y1': int(y1),
+                            'x2': int(x2),
+                            'y2': int(y2),
+                            'width': int(x2 - x1),
+                            'height': int(y2 - y1)
+                        }
+                    }
+                    license_plates.append(license_plate)
+
+            return license_plates
+        except Exception as e:
+            logger.warning(f"Error detecting license plate: {e}")
+            return []
+
     def _process_results(self, results, image_shape: tuple) -> List[dict]:
         """
         Process YOLO results and filter for vehicles.
@@ -285,9 +403,13 @@ class VehicleDetector:
                             'y2': int(y2),
                             'width': int(x2 - x1),
                             'height': int(y2 - y1)
-                        }
+                        },
+                        'license_plates': []
                     }
                     detections.append(detection)
+
+            # Sort detections by confidence (highest first) and limit to max_vehicles
+            detections.sort(key=lambda x: x['confidence'], reverse=True)
 
         return detections
 
@@ -339,6 +461,28 @@ class VehicleDetector:
                        (bbox['x1'], bbox['y1'] - 5),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
 
+            # Draw license plate detections (in vehicle coordinates)
+            if 'license_plates' in detection and detection['license_plates']:
+                vehicle_x1, vehicle_y1 = bbox['x1'], bbox['y1']
+
+                for i, plate in enumerate(detection['license_plates']):
+                    plate_bbox = plate['bbox']
+
+                    # Convert plate coordinates to image coordinates
+                    x1 = vehicle_x1 + plate_bbox['x1']
+                    y1 = vehicle_y1 + plate_bbox['y1']
+                    x2 = vehicle_x1 + plate_bbox['x2']
+                    y2 = vehicle_y1 + plate_bbox['y2']
+
+                    # Draw license plate bounding box
+                    cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 255), 2)
+
+                    # Draw license plate label
+                    plate_label = f"License Plate: {plate['confidence']:.2f}"
+                    cv2.putText(image, plate_label,
+                               (x1, y1 - 5),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+
         return image
 
     def get_detection_statistics(self, detections: List[dict]) -> dict:
@@ -355,7 +499,8 @@ class VehicleDetector:
             'total_vehicles': len(detections),
             'vehicle_types': {},
             'average_confidence': 0.0,
-            'confidence_range': {'min': 1.0, 'max': 0.0}
+            'confidence_range': {'min': 1.0, 'max': 0.0},
+            'license_plates_detected': 0
         }
 
         if detections:
@@ -364,10 +509,12 @@ class VehicleDetector:
             stats['confidence_range']['min'] = np.min(confidences)
             stats['confidence_range']['max'] = np.max(confidences)
 
-            # Count vehicle types
+            # Count vehicle types and license plates
             for detection in detections:
                 vehicle_type = detection['class_name']
                 stats['vehicle_types'][vehicle_type] = stats['vehicle_types'].get(vehicle_type, 0) + 1
+                if 'license_plates' in detection:
+                    stats['license_plates_detected'] += len(detection['license_plates'])
 
         return stats
 
