@@ -34,7 +34,7 @@ class VehicleDetector:
     def __init__(self,
                 model_path: str = "yolov8n.pt",
                 confidence_threshold: float = 0.5,
-                license_plate_model_path: str = "licenseplatedetectyolo.pt",
+                license_plate_model_path: str = "licensePlatedetectyolo.pt",
                 license_plate_confidence: float = 0.5,
                 max_vehicles: int = 2,
                 device: str = "cpu"):
