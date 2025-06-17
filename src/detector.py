@@ -5,7 +5,6 @@ It also detects license plates within detected vehicles.
 """
 
 import cv2
-import numpy as np
 import logging
 from pathlib import Path
 import time
@@ -258,92 +257,193 @@ class VehicleDetector:
             logger.error(f"Error processing video: {e}")
             raise
     
-    def detect_vehicles_camera(self, camera_index: int = 0, display_fps: bool = True) -> None:
+    def detect_vehicles_camera(self, camera_index: int = 0, display_fps: bool = True, use_picamera: bool = False) -> None:
         """
         Detect vehicles from live camera feed.
         
         Args:
             camera_index (int): Camera index (usually 0 for default camera)
             display_fps (bool): Whether to display FPS information
+            use_picamera (bool): Whether to use the Raspberry Pi camera module with libcamera
         """
         try:
-            cap = cv2.VideoCapture(camera_index)
-            if not cap.isOpened():
-                raise ValueError(f"Could not open camera with index: {camera_index}")
-            
-            logger.info("Starting live vehicle detection. Press 'q' to quit.")
-            
-            # FPS calculation variables
-            fps_counter = 0
-            fps_start_time = time.time()
-            current_fps = 0
-            
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    logger.warning("Failed to read frame from camera")
-                    continue
-                
-                # Run inference with error handling
-                start_inference = time.time()
+            if use_picamera:
+                # Use libcamera for Raspberry Pi - alternative approach using libcamera-still for snapshots
                 try:
-                    results = self.vehicle_model.predict(frame)
-                    detections = self.vehicle_model.process_results(results[0], frame.shape)
-                    inference_time = time.time() - start_inference
-                except Exception as inference_error:
-                    logger.warning(f"Inference error: {inference_error}")
-                    # Continue with empty detections
-                    detections = []
-                    inference_time = time.time() - start_inference
-                
-                # Limit to max_vehicles
-                detections = detections[:self.max_vehicles] if len(detections) > self.max_vehicles else detections
-                
-                # Detect license plates in each vehicle
-                for detection in detections:
-                    vehicle_crop = crop_vehicle(frame, detection['bbox'])
-                    license_plates = self.license_plate_model.detect_license_plates(vehicle_crop)
+                    import subprocess
+                    import numpy as np
+                    import os
+                    import tempfile
                     
-                    # Perform OCR on each license plate
-                    for plate in license_plates:
-                        plate_crop = crop_vehicle(vehicle_crop, plate['bbox'])
-                        ocr_result = self.ocr_model.recognize_text(plate_crop)
-                        plate['ocr_text'] = ocr_result['text']
-                        plate['ocr_confidence'] = ocr_result['confidence']
+                    logger.info("Starting Raspberry Pi camera detection with libcamera. Press 'q' to quit.")
                     
-                    detection['license_plates'] = license_plates
-                
-                # Draw detections
-                annotated_frame = draw_detections(frame.copy(), detections)
-                
-                # Calculate FPS
-                fps_counter += 1
-                if fps_counter >= 30:
-                    current_fps = fps_counter / (time.time() - fps_start_time) if time.time() - fps_start_time > 0 else 0
+                    # FPS calculation variables
                     fps_counter = 0
                     fps_start_time = time.time()
+                    current_fps = 0
+                    
+                    # Create a temporary file for image captures
+                    with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as temp_file:
+                        temp_path = temp_file.name
+                    
+                    running = True
+                    while running:
+                        # Capture a single frame using libcamera-jpeg
+                        try:
+                            subprocess.run([
+                                "libcamera-jpeg", 
+                                "-o", temp_path, 
+                                "--width", "640", 
+                                "--height", "480",
+                                "-n",  # Don't show preview window
+                                "-t", "1"  # Minimize timeout
+                            ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            
+                            # Read the saved image
+                            frame = cv2.imread(temp_path)
+                            if frame is None:
+                                logger.warning("Failed to read frame from libcamera")
+                                continue
+                            
+                            # Run inference
+                            start_inference = time.time()
+                            try:
+                                results = self.vehicle_model.predict(frame)
+                                detections = self.vehicle_model.process_results(results[0], frame.shape)
+                                inference_time = time.time() - start_inference
+                            except Exception as inference_error:
+                                logger.warning(f"Inference error: {inference_error}")
+                                detections = []
+                                inference_time = time.time() - start_inference
+                            
+                            # Limit to max_vehicles
+                            detections = detections[:self.max_vehicles] if len(detections) > self.max_vehicles else detections
+                            
+                            # Detect license plates in each vehicle
+                            for detection in detections:
+                                vehicle_crop = crop_vehicle(frame, detection['bbox'])
+                                license_plates = self.license_plate_model.detect_license_plates(vehicle_crop)
+                                
+                                # Perform OCR on each license plate
+                                for plate in license_plates:
+                                    plate_crop = crop_vehicle(vehicle_crop, plate['bbox'])
+                                    ocr_result = self.ocr_model.recognize_text(plate_crop)
+                                    plate['ocr_text'] = ocr_result['text']
+                                    plate['ocr_confidence'] = ocr_result['confidence']
+                                
+                                detection['license_plates'] = license_plates
+                            
+                            # Draw detections
+                            annotated_frame = draw_detections(frame.copy(), detections)
+                            
+                            # Calculate FPS
+                            fps_counter += 1
+                            if fps_counter >= 10:  # Update FPS every 10 frames
+                                current_fps = fps_counter / (time.time() - fps_start_time) if time.time() - fps_start_time > 0 else 0
+                                fps_counter = 0
+                                fps_start_time = time.time()
+                            
+                            # Add information overlay
+                            frame_info = {
+                                'inference_time': inference_time,
+                                'current_fps': current_fps
+                            }
+                            annotated_frame = add_info_overlay(annotated_frame, detections, frame_info, display_fps)
+                            
+                            # Display frame
+                            cv2.imshow('Raspberry Pi Camera Detection', annotated_frame)
+                            
+                            # Check for quit command
+                            if cv2.waitKey(1) & 0xFF == ord('q'):
+                                running = False
+                                
+                        except subprocess.CalledProcessError as e:
+                            logger.error(f"Error calling libcamera: {e}")
+                            time.sleep(1)  # Prevent tight loop if camera is having issues
+                            
+                except Exception as e:
+                    logger.error(f"Error with libcamera: {e}")
+                    raise
                 
-                # Add information overlay
-                frame_info = {
-                    'inference_time': inference_time,
-                    'current_fps': current_fps
-                }
-                annotated_frame = add_info_overlay(annotated_frame, detections, frame_info, display_fps)
+            else:
+                # Original OpenCV camera code
+                cap = cv2.VideoCapture(camera_index)
+                if not cap.isOpened():
+                    raise ValueError(f"Could not open camera with index: {camera_index}")
                 
-                # Display frame
-                cv2.imshow('Live Vehicle Detection', annotated_frame)
+                logger.info("Starting live vehicle detection. Press 'q' to quit.")
                 
-                # Check for quit command
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
-            
-            # Clean up
-            cap.release()
-            cv2.destroyAllWindows()
-            logger.info("Live detection stopped")
+                # FPS calculation variables
+                fps_counter = 0
+                fps_start_time = time.time()
+                current_fps = 0
+                
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        logger.warning("Failed to read frame from camera")
+                        continue
+                    
+                    # Run inference with error handling
+                    start_inference = time.time()
+                    try:
+                        results = self.vehicle_model.predict(frame)
+                        detections = self.vehicle_model.process_results(results[0], frame.shape)
+                        inference_time = time.time() - start_inference
+                    except Exception as inference_error:
+                        logger.warning(f"Inference error: {inference_error}")
+                        # Continue with empty detections
+                        detections = []
+                        inference_time = time.time() - start_inference
+                    
+                    # Limit to max_vehicles
+                    detections = detections[:self.max_vehicles] if len(detections) > self.max_vehicles else detections
+                    
+                    # Detect license plates in each vehicle
+                    for detection in detections:
+                        vehicle_crop = crop_vehicle(frame, detection['bbox'])
+                        license_plates = self.license_plate_model.detect_license_plates(vehicle_crop)
+                        
+                        # Perform OCR on each license plate
+                        for plate in license_plates:
+                            plate_crop = crop_vehicle(vehicle_crop, plate['bbox'])
+                            ocr_result = self.ocr_model.recognize_text(plate_crop)
+                            plate['ocr_text'] = ocr_result['text']
+                            plate['ocr_confidence'] = ocr_result['confidence']
+                        
+                        detection['license_plates'] = license_plates
+                    
+                    # Draw detections
+                    annotated_frame = draw_detections(frame.copy(), detections)
+                    
+                    # Calculate FPS
+                    fps_counter += 1
+                    if fps_counter >= 30:
+                        current_fps = fps_counter / (time.time() - fps_start_time) if time.time() - fps_start_time > 0 else 0
+                        fps_counter = 0
+                        fps_start_time = time.time()
+                    
+                    # Add information overlay
+                    frame_info = {
+                        'inference_time': inference_time,
+                        'current_fps': current_fps
+                    }
+                    annotated_frame = add_info_overlay(annotated_frame, detections, frame_info, display_fps)
+                    
+                    # Display frame
+                    cv2.imshow('Live Vehicle Detection', annotated_frame)
+                    
+                    # Check for quit command
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        break
+                
+                # Clean up
+                cap.release()
+                cv2.destroyAllWindows()
+                logger.info("Live detection stopped")
         
         except Exception as e:
-            logger.error(f"Error in live detection: {e}")
+            logger.error(f"Error in camera detection: {e}")
             raise
     
     def get_detection_statistics(self, detections: List[dict]) -> dict:
@@ -357,3 +457,4 @@ class VehicleDetector:
             dict: Detection statistics
         """
         return get_detection_statistics(detections)
+                

@@ -23,7 +23,7 @@ def main():
     print("=" * 40)
     print("1. Image detection")
     print("2. Video detection")
-    print("3. Live camera detection")
+    print("3. Live camera detection (Raspberry Pi)")
     print("4. Exit")
     
     while True:
@@ -62,12 +62,13 @@ def main():
                 print("Video file not found!")
         
         elif choice == '3':
-            camera_index = input("Enter camera index (default 0): ").strip()
-            camera_index = int(camera_index) if camera_index.isdigit() else 0
             try:
-                detector.detect_vehicles_camera(camera_index)
+                print("Starting Raspberry Pi camera detection using libcamera...")
+                detector.detect_vehicles_camera(use_picamera=True)
             except Exception as e:
-                print(f"Error: {e}")
+                print(f"Error with camera: {e}")
+                print("If libcamera is not installed, install it with:")
+                print("sudo apt-get update && sudo apt-get install -y libcamera-apps")
         
         elif choice == '4':
             print("Goodbye!")
